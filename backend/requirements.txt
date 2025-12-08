@@ -12,3 +12,4 @@ unstructured[pdf]>=0.16.0
 pypdf>=4.0.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+spacy>=3.7.0

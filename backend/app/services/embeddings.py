@@ -138,7 +138,8 @@ def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
         return {
             "num_chunks": len(chunks),
             "collection_name": collection_name,
-            "doc_id": doc_id
+            "doc_id": doc_id,
+            "chunks": chunks  # Return chunks for further processing
         }
         
     except Exception as e:
