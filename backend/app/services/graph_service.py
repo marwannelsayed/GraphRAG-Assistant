@@ -382,3 +382,349 @@ class GraphService:
         except Exception as e:
             logger.error(f"Error querying entities: {e}")
             return []
+    
+    def query_graph_for_question(self, question: str) -> Dict:
+        """
+        Query the knowledge graph based on a natural language question.
+        
+        This function converts a question to appropriate Cypher queries using
+        keyword-based templates. It provides fallback strategies for different
+        question types.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            Dictionary containing:
+            - entities: List of relevant entities with their relationships
+            - chunks: List of chunks that mention these entities
+            - graph_facts: Formatted text describing the graph context
+        """
+        question_lower = question.lower()
+        
+        # Extract keywords from question
+        keywords = self._extract_keywords(question_lower)
+        
+        # Determine query strategy based on question type
+        if any(word in question_lower for word in ["who", "which", "what"]):
+            # Entity-focused query
+            results = self._query_entities_by_keywords(keywords)
+        elif any(word in question_lower for word in ["depends", "depend", "relationship", "related to"]):
+            # Relationship-focused query
+            results = self._query_relationships_by_keywords(keywords)
+        elif any(word in question_lower for word in ["list", "all", "show"]):
+            # List query - broader search
+            results = self._query_entities_broad(keywords)
+        elif any(word in question_lower for word in ["related", "connection", "link"]):
+            # Connection query
+            results = self._query_connected_entities(keywords)
+        else:
+            # Default: search for entities matching keywords
+            results = self._query_entities_by_keywords(keywords)
+        
+        # Format results
+        graph_facts = self._format_graph_facts(results)
+        
+        return {
+            "entities": results.get("entities", []),
+            "chunks": results.get("chunks", []),
+            "graph_facts": graph_facts,
+            "node_ids": results.get("node_ids", [])
+        }
+    
+    def _extract_keywords(self, question: str) -> List[str]:
+        """
+        Extract potential entity names and keywords from question.
+        
+        Args:
+            question: Lowercase question text
+            
+        Returns:
+            List of potential keywords
+        """
+        # Remove common question words
+        stop_words = {"who", "what", "where", "when", "why", "how", "is", "are", "was", "were",
+                     "the", "a", "an", "in", "on", "at", "to", "for", "of", "with", "by",
+                     "depends", "depend", "related", "list", "all", "show", "about"}
+        
+        # Tokenize and filter
+        words = question.replace("?", "").split()
+        keywords = [w.strip() for w in words if w.strip() and w.strip() not in stop_words]
+        
+        # Also extract potential multi-word entities (capitalized phrases in original question)
+        return keywords
+    
+    def _query_entities_by_keywords(self, keywords: List[str]) -> Dict:
+        """
+        Query entities that match keywords in their name or description.
+        
+        Args:
+            keywords: List of keywords to search for
+            
+        Returns:
+            Dictionary with entities, chunks, and node_ids
+        """
+        if not keywords:
+            return {"entities": [], "chunks": [], "node_ids": []}
+        
+        # Build case-insensitive regex pattern
+        keyword_pattern = "|".join(keywords)
+        
+        query = """
+        MATCH (e:Entity)
+        WHERE ANY(keyword IN $keywords WHERE toLower(e.name) CONTAINS toLower(keyword))
+           OR ANY(keyword IN $keywords WHERE toLower(e.description) CONTAINS toLower(keyword))
+        OPTIONAL MATCH (e)-[r:RELATES_TO]->(related:Entity)
+        OPTIONAL MATCH (c:Chunk)-[:MENTIONS]->(e)
+        RETURN e.name AS name, e.type AS type, e.description AS description,
+               collect(DISTINCT {relation: r.type, target: related.name, target_type: related.type}) AS relationships,
+               collect(DISTINCT {chunk_id: c.id, text: c.text}) AS chunks
+        LIMIT 10
+        """
+        
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, keywords=keywords)
+                entities = []
+                all_chunks = []
+                node_ids = []
+                
+                for record in result:
+                    entity_id = f"{record['name']}|{record['type']}"
+                    node_ids.append(entity_id)
+                    
+                    entities.append({
+                        "name": record["name"],
+                        "type": record["type"],
+                        "description": record["description"],
+                        "relationships": [r for r in record["relationships"] if r["relation"]]
+                    })
+                    
+                    # Collect chunks
+                    for chunk in record["chunks"]:
+                        if chunk["chunk_id"]:
+                            all_chunks.append(chunk)
+                
+                return {
+                    "entities": entities,
+                    "chunks": all_chunks[:5],  # Limit chunks
+                    "node_ids": node_ids
+                }
+        except Exception as e:
+            logger.error(f"Error querying entities by keywords: {e}")
+            return {"entities": [], "chunks": [], "node_ids": []}
+    
+    def _query_relationships_by_keywords(self, keywords: List[str]) -> Dict:
+        """
+        Query relationships and dependencies between entities.
+        
+        Args:
+            keywords: List of keywords to search for
+            
+        Returns:
+            Dictionary with entities, chunks, and node_ids
+        """
+        if not keywords:
+            return {"entities": [], "chunks": [], "node_ids": []}
+        
+        query = """
+        MATCH (e1:Entity)-[r:RELATES_TO]->(e2:Entity)
+        WHERE ANY(keyword IN $keywords WHERE 
+                  toLower(e1.name) CONTAINS toLower(keyword) OR 
+                  toLower(e2.name) CONTAINS toLower(keyword) OR
+                  toLower(r.type) CONTAINS toLower(keyword))
+        RETURN e1.name AS source_name, e1.type AS source_type, e1.description AS source_desc,
+               r.type AS relation,
+               e2.name AS target_name, e2.type AS target_type, e2.description AS target_desc
+        LIMIT 10
+        """
+        
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, keywords=keywords)
+                entities = []
+                node_ids = []
+                seen_entities = set()
+                
+                for record in result:
+                    source_id = f"{record['source_name']}|{record['source_type']}"
+                    target_id = f"{record['target_name']}|{record['target_type']}"
+                    
+                    if source_id not in seen_entities:
+                        seen_entities.add(source_id)
+                        node_ids.append(source_id)
+                        entities.append({
+                            "name": record["source_name"],
+                            "type": record["source_type"],
+                            "description": record["source_desc"],
+                            "relationships": [{
+                                "relation": record["relation"],
+                                "target": record["target_name"],
+                                "target_type": record["target_type"]
+                            }]
+                        })
+                    
+                    if target_id not in seen_entities:
+                        seen_entities.add(target_id)
+                        node_ids.append(target_id)
+                        entities.append({
+                            "name": record["target_name"],
+                            "type": record["target_type"],
+                            "description": record["target_desc"],
+                            "relationships": []
+                        })
+                
+                return {
+                    "entities": entities,
+                    "chunks": [],
+                    "node_ids": node_ids
+                }
+        except Exception as e:
+            logger.error(f"Error querying relationships: {e}")
+            return {"entities": [], "chunks": [], "node_ids": []}
+    
+    def _query_entities_broad(self, keywords: List[str]) -> Dict:
+        """
+        Broader entity query for list-type questions.
+        
+        Args:
+            keywords: List of keywords to search for
+            
+        Returns:
+            Dictionary with entities, chunks, and node_ids
+        """
+        if not keywords:
+            # If no specific keywords, return recent entities
+            query = """
+            MATCH (e:Entity)
+            OPTIONAL MATCH (e)-[r:RELATES_TO]->(related:Entity)
+            RETURN e.name AS name, e.type AS type, e.description AS description,
+                   collect(DISTINCT {relation: r.type, target: related.name, target_type: related.type}) AS relationships
+            ORDER BY e.created_at DESC
+            LIMIT 15
+            """
+            params = {}
+        else:
+            # Filter by entity type or keywords
+            query = """
+            MATCH (e:Entity)
+            WHERE ANY(keyword IN $keywords WHERE 
+                      toLower(e.type) CONTAINS toLower(keyword) OR
+                      toLower(e.name) CONTAINS toLower(keyword))
+            OPTIONAL MATCH (e)-[r:RELATES_TO]->(related:Entity)
+            RETURN e.name AS name, e.type AS type, e.description AS description,
+                   collect(DISTINCT {relation: r.type, target: related.name, target_type: related.type}) AS relationships
+            LIMIT 15
+            """
+            params = {"keywords": keywords}
+        
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, params)
+                entities = []
+                node_ids = []
+                
+                for record in result:
+                    entity_id = f"{record['name']}|{record['type']}"
+                    node_ids.append(entity_id)
+                    
+                    entities.append({
+                        "name": record["name"],
+                        "type": record["type"],
+                        "description": record["description"],
+                        "relationships": [r for r in record["relationships"] if r["relation"]]
+                    })
+                
+                return {
+                    "entities": entities,
+                    "chunks": [],
+                    "node_ids": node_ids
+                }
+        except Exception as e:
+            logger.error(f"Error in broad entity query: {e}")
+            return {"entities": [], "chunks": [], "node_ids": []}
+    
+    def _query_connected_entities(self, keywords: List[str]) -> Dict:
+        """
+        Query entities and their connections (2-hop neighborhood).
+        
+        Args:
+            keywords: List of keywords to search for
+            
+        Returns:
+            Dictionary with entities, chunks, and node_ids
+        """
+        if not keywords:
+            return {"entities": [], "chunks": [], "node_ids": []}
+        
+        query = """
+        MATCH (e:Entity)
+        WHERE ANY(keyword IN $keywords WHERE toLower(e.name) CONTAINS toLower(keyword))
+        OPTIONAL MATCH path = (e)-[r:RELATES_TO*1..2]-(connected:Entity)
+        WITH e, connected, relationships(path) AS rels
+        RETURN e.name AS name, e.type AS type, e.description AS description,
+               collect(DISTINCT {name: connected.name, type: connected.type}) AS connected_entities
+        LIMIT 10
+        """
+        
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, keywords=keywords)
+                entities = []
+                node_ids = []
+                
+                for record in result:
+                    entity_id = f"{record['name']}|{record['type']}"
+                    node_ids.append(entity_id)
+                    
+                    entities.append({
+                        "name": record["name"],
+                        "type": record["type"],
+                        "description": record["description"],
+                        "connected_entities": [c for c in record["connected_entities"] if c["name"]]
+                    })
+                
+                return {
+                    "entities": entities,
+                    "chunks": [],
+                    "node_ids": node_ids
+                }
+        except Exception as e:
+            logger.error(f"Error querying connected entities: {e}")
+            return {"entities": [], "chunks": [], "node_ids": []}
+    
+    def _format_graph_facts(self, results: Dict) -> str:
+        """
+        Format graph query results into readable text for LLM context.
+        
+        Args:
+            results: Dictionary with entities and chunks
+            
+        Returns:
+            Formatted string describing graph facts
+        """
+        if not results.get("entities"):
+            return ""
+        
+        facts = []
+        facts.append("=== Knowledge Graph Context ===\n")
+        
+        for entity in results["entities"]:
+            fact_parts = [f"- {entity['name']} ({entity['type']})"]
+            
+            if entity.get("description"):
+                fact_parts.append(f": {entity['description']}")
+            
+            if entity.get("relationships"):
+                fact_parts.append("\n  Relationships:")
+                for rel in entity["relationships"]:
+                    fact_parts.append(f"\n    • {rel['relation']} → {rel['target']} ({rel['target_type']})")
+            
+            if entity.get("connected_entities"):
+                fact_parts.append("\n  Connected to:")
+                for conn in entity["connected_entities"][:5]:  # Limit connections
+                    fact_parts.append(f"\n    • {conn['name']} ({conn['type']})")
+            
+            facts.append("".join(fact_parts))
+        
+        return "\n".join(facts)
