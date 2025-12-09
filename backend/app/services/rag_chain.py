@@ -1,4 +1,29 @@
 """
+RAG (Retrieval-Augmented Generation) utilities.
+"""
+
+
+def build_rag_chain(llm, retriever):
+    """
+    Build a basic LangChain ConversationalRetrievalChain that returns source docs.
+
+    Args:
+        llm: A LangChain LLM instance (e.g., ChatOpenAI, FakeListLLM for tests)
+        retriever: A LangChain retriever (e.g., Chroma retriever)
+
+    Returns:
+        A configured ConversationalRetrievalChain instance.
+    """
+    # Lazy import to avoid heavy dependencies during tests
+    from langchain.chains import ConversationalRetrievalChain
+
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        return_source_documents=True,
+        verbose=False,
+    )
+"""
 RAG (Retrieval-Augmented Generation) chain for answering queries.
 """
 from typing import List, Dict, Optional
