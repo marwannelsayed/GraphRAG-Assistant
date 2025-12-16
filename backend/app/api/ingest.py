@@ -9,7 +9,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, status
 from pydantic import BaseModel
 
 from app.services.embeddings import ingest_pdf_to_chroma
-from app.services.extractor import extract_entities_sections, extract_relations_with_llm
+from app.services.extractor import extract_structured_information
 from app.services.graph_service import GraphService
 
 logger = logging.getLogger(__name__)
@@ -131,16 +131,26 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
                     "source": str(file_path)
                 })
                 
-                # Process each chunk for entity/relation extraction
-                all_entities = []
-                all_relations = []
+                # OPTIMIZED: Extract entities and relationships from ALL chunks in batch
+                # This uses the performance-limited extract_structured_information function
+                chunk_texts = [
+                    chunk.page_content if hasattr(chunk, 'page_content') else str(chunk)
+                    for chunk in chunks
+                ]
                 
+                logger.info(f"Batch extracting entities and relationships from {len(chunk_texts)} chunks (limit: first 5 chunks for LLM relationships)")
+                extraction_result = extract_structured_information(chunk_texts)
+                
+                all_entities = extraction_result["entities"]
+                all_relations = extraction_result["relationships"]
+                
+                logger.info(f"Extracted {len(all_entities)} entities and {len(all_relations)} relationships in batch")
+                
+                # Now upsert chunks and link entities
                 for i, chunk in enumerate(chunks):
                     chunk_id = f"{doc_id}_chunk_{i}"
                     chunk_text = chunk.page_content if hasattr(chunk, 'page_content') else str(chunk)
                     chunk_metadata = chunk.metadata if hasattr(chunk, 'metadata') else {}
-                    
-                    logger.debug(f"Processing chunk {i+1}/{num_chunks} for extraction")
                     
                     # Upsert chunk in Neo4j
                     try:
@@ -153,72 +163,62 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
                         )
                     except Exception as e:
                         logger.warning(f"Failed to upsert chunk {chunk_id}: {e}")
-                    
-                    # Extract entities using spaCy
+                
+                # Upsert all entities
+                entity_id_map = {}  # Map entity text|label to Neo4j ID
+                for entity in all_entities:
                     try:
-                        entities = extract_entities_sections(chunk_text)
-                        logger.debug(f"Extracted {len(entities)} entities from chunk {i+1}")
-                        
-                        # Upsert entities and link to chunk
-                        for entity in entities:
-                            try:
-                                entity_id = graph_service.upsert_entity(entity)
-                                graph_service.link_chunk_to_entity(chunk_id, entity_id)
-                                all_entities.append(entity)
-                            except Exception as e:
-                                logger.warning(f"Failed to upsert entity {entity.get('text')}: {e}")
+                        entity_id = graph_service.upsert_entity(entity)
+                        entity_key = f"{entity['text']}|{entity['label']}"
+                        entity_id_map[entity_key] = entity_id
                     except Exception as e:
-                        logger.warning(f"Entity extraction failed for chunk {i+1}: {e}")
-                    
-                    # Extract relations using LLM
+                        logger.warning(f"Failed to upsert entity {entity.get('text')}: {e}")
+                
+                # Upsert all relations
+                for relation in all_relations:
                     try:
-                        relations = extract_relations_with_llm(chunk_text)
-                        logger.debug(f"Extracted {len(relations)} relations from chunk {i+1}")
+                        subject = relation["subject"]
+                        relation_type = relation["relation"]
+                        obj = relation["object"]
                         
-                        # Upsert relations
-                        for relation in relations:
+                        # Try to find subject entity
+                        subject_id = None
+                        for entity_key, eid in entity_id_map.items():
+                            if entity_key.startswith(subject + "|"):
+                                subject_id = eid
+                                break
+                        
+                        # Create placeholder if not found
+                        if not subject_id:
+                            subject_entity = {"text": subject, "label": "CONCEPT", "description": ""}
                             try:
-                                subject = relation["subject"]
-                                relation_type = relation["relation"]
-                                obj = relation["object"]
-                                
-                                # Find or create subject entity
-                                subject_entities = [e for e in all_entities if e["text"] == subject]
-                                if not subject_entities:
-                                    # Create placeholder entity for subject
-                                    subject_entity = {"text": subject, "label": "CONCEPT", "description": ""}
-                                    try:
-                                        subject_id = graph_service.upsert_entity(subject_entity)
-                                        all_entities.append(subject_entity)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to create subject entity {subject}: {e}")
-                                        continue
-                                else:
-                                    subject_entity = subject_entities[0]
-                                    subject_id = f"{subject_entity['text']}|{subject_entity['label']}"
-                                
-                                # Find or create object entity
-                                object_entities = [e for e in all_entities if e["text"] == obj]
-                                if not object_entities:
-                                    # Create placeholder entity for object
-                                    object_entity = {"text": obj, "label": "CONCEPT", "description": ""}
-                                    try:
-                                        object_id = graph_service.upsert_entity(object_entity)
-                                        all_entities.append(object_entity)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to create object entity {obj}: {e}")
-                                        continue
-                                else:
-                                    object_entity = object_entities[0]
-                                    object_id = f"{object_entity['text']}|{object_entity['label']}"
-                                
-                                # Upsert relation
-                                if graph_service.upsert_relation(subject_id, relation_type, object_id):
-                                    all_relations.append(relation)
+                                subject_id = graph_service.upsert_entity(subject_entity)
+                                entity_id_map[f"{subject}|CONCEPT"] = subject_id
                             except Exception as e:
-                                logger.warning(f"Failed to upsert relation: {e}")
+                                logger.warning(f"Failed to create subject entity {subject}: {e}")
+                                continue
+                        
+                        # Try to find object entity
+                        object_id = None
+                        for entity_key, eid in entity_id_map.items():
+                            if entity_key.startswith(obj + "|"):
+                                object_id = eid
+                                break
+                        
+                        # Create placeholder if not found
+                        if not object_id:
+                            object_entity = {"text": obj, "label": "CONCEPT", "description": ""}
+                            try:
+                                object_id = graph_service.upsert_entity(object_entity)
+                                entity_id_map[f"{obj}|CONCEPT"] = object_id
+                            except Exception as e:
+                                logger.warning(f"Failed to create object entity {obj}: {e}")
+                                continue
+                        
+                        # Upsert relation
+                        graph_service.upsert_relation(subject_id, relation_type, object_id)
                     except Exception as e:
-                        logger.warning(f"Relation extraction failed for chunk {i+1}: {e}")
+                        logger.warning(f"Failed to upsert relation: {e}")
                 
                 num_entities = len(all_entities)
                 num_relations = len(all_relations)
@@ -292,3 +292,79 @@ async def get_ingestion_status(job_id: str):
     TODO: Implement job status tracking.
     """
     raise HTTPException(status_code=501, detail="Not implemented yet")
+
+
+class UploadedDocument(BaseModel):
+    """Model for uploaded document information."""
+    filename: str
+    collection_name: str
+    file_size: int
+    upload_date: str
+    file_path: str
+
+
+@router.get("/documents", response_model=List[UploadedDocument])
+async def list_uploaded_documents():
+    """
+    List all uploaded documents.
+    
+    Returns a list of documents that have been uploaded to the system,
+    including their filename, collection name, file size, and upload date.
+    """
+    try:
+        documents = []
+        
+        # Check if uploads directory exists
+        if not UPLOAD_DIR.exists():
+            return documents
+        
+        # Iterate through all PDF files in uploads directory
+        for file_path in UPLOAD_DIR.glob("*.pdf"):
+            try:
+                # Get file stats
+                stats = file_path.stat()
+                
+                # Extract original filename (remove UUID suffix)
+                filename = file_path.name
+                # Try to extract original name before UUID
+                if "_" in filename:
+                    parts = filename.rsplit("_", 1)
+                    if len(parts) == 2 and len(parts[1]) > 10:
+                        original_filename = parts[0] + ".pdf"
+                    else:
+                        original_filename = filename
+                else:
+                    original_filename = filename
+                
+                # Generate collection name (same logic as ingestion)
+                collection_name = original_filename.lower().replace(".pdf", "").replace(" ", "_").replace("-", "_")
+                # Remove non-alphanumeric characters except underscores
+                collection_name = "".join(c for c in collection_name if c.isalnum() or c == "_")
+                
+                # Get modification time
+                from datetime import datetime
+                upload_date = datetime.fromtimestamp(stats.st_mtime).isoformat()
+                
+                documents.append(UploadedDocument(
+                    filename=original_filename,
+                    collection_name=collection_name,
+                    file_size=stats.st_size,
+                    upload_date=upload_date,
+                    file_path=str(file_path)
+                ))
+            except Exception as e:
+                logger.warning(f"Failed to process file {file_path}: {e}")
+                continue
+        
+        # Sort by upload date (most recent first)
+        documents.sort(key=lambda x: x.upload_date, reverse=True)
+        
+        logger.info(f"Found {len(documents)} uploaded documents")
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Failed to list documents: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list documents: {str(e)}"
+        )

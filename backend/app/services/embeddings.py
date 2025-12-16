@@ -6,12 +6,79 @@ import logging
 from typing import List
 from uuid import uuid4
 
-from langchain_community.document_loaders import UnstructuredPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
 logger = logging.getLogger(__name__)
+
+
+def verify_mps_support():
+    """
+    Verify MPS (Metal Performance Shaders) support for M1/M2 Macs.
+    Returns tuple: (is_available, device_name, details)
+    """
+    try:
+        import torch
+        mps_available = torch.backends.mps.is_available()
+        mps_built = torch.backends.mps.is_built()
+        
+        details = {
+            'pytorch_version': torch.__version__,
+            'mps_available': mps_available,
+            'mps_built': mps_built,
+        }
+        
+        if mps_available and mps_built:
+            logger.info(f"✅ MPS GPU Support: ENABLED (PyTorch {torch.__version__})")
+            logger.info(f"   - MPS Available: {mps_available}")
+            logger.info(f"   - MPS Built: {mps_built}")
+            return True, 'mps', details
+        elif not mps_built:
+            logger.warning(f"⚠️  MPS not built in PyTorch {torch.__version__}")
+            return False, 'cpu', details
+        else:
+            logger.warning(f"⚠️  MPS not available on this system")
+            return False, 'cpu', details
+            
+    except ImportError as e:
+        logger.warning(f"⚠️  PyTorch not installed: {e}")
+        return False, 'cpu', {'error': str(e)}
+    except Exception as e:
+        logger.error(f"❌ Error checking MPS support: {e}")
+        return False, 'cpu', {'error': str(e)}
+
+
+def get_embeddings():
+    """
+    Get embedding model based on configuration.
+    Uses local sentence-transformers model with GPU acceleration on M1/M2 Macs.
+    """
+    embedding_model = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    
+    # Verify and use MPS (Metal Performance Shaders) for M1/M2 Macs
+    mps_supported, device, details = verify_mps_support()
+    
+    if mps_supported:
+        logger.info(f"🚀 Initializing embeddings with M1/M2 GPU acceleration")
+        logger.info(f"   - Model: {embedding_model}")
+        logger.info(f"   - Device: {device}")
+    else:
+        logger.info(f"📊 Initializing embeddings with CPU")
+        logger.info(f"   - Model: {embedding_model}")
+        logger.info(f"   - Device: {device}")
+    
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embedding_model,
+        model_kwargs={'device': device},
+        encode_kwargs={'normalize_embeddings': True}
+    )
+    
+    # Log successful initialization
+    logger.info(f"✅ Embeddings initialized successfully on device: {device}")
+    
+    return embeddings
 
 
 def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
@@ -30,7 +97,6 @@ def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
         
     Raises:
         FileNotFoundError: If PDF file doesn't exist
-        ValueError: If OpenAI API key is not set
         Exception: For other ingestion errors
     """
     logger.info(f"Starting PDF ingestion: {pdf_path} -> collection: {collection_name}")
@@ -41,21 +107,14 @@ def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
         logger.error(error_msg)
         raise FileNotFoundError(error_msg)
     
-    # Check for OpenAI API key
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        error_msg = "OPENAI_API_KEY environment variable not set"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
-    
     try:
         # Generate unique document ID
         doc_id = str(uuid4())
         logger.info(f"Assigned document ID: {doc_id}")
         
-        # Load PDF using LangChain
-        logger.info(f"Loading PDF: {pdf_path}")
-        loader = UnstructuredPDFLoader(pdf_path)
+        # Load PDF using the more robust PyMuPDFLoader
+        logger.info(f"Loading PDF with PyMuPDFLoader: {pdf_path}")
+        loader = PyMuPDFLoader(pdf_path)
         documents = loader.load()
         
         if not documents:
@@ -71,8 +130,8 @@ def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
         # Split documents into chunks
         logger.info("Splitting documents into chunks...")
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=1500,
+            chunk_overlap=250,
             length_function=len,
         )
         chunks = text_splitter.split_documents(documents)
@@ -109,16 +168,15 @@ def ingest_pdf_to_chroma(pdf_path: str, collection_name: str) -> dict:
                         page_num = int(source.split(":page:")[-1])
                         chunk.metadata["page"] = page_num
                     except (ValueError, IndexError):
-                        chunk.metadata["page"] = None
+                        chunk.metadata["page"] = 0  # Use 0 instead of None for Neo4j compatibility
                 else:
-                    chunk.metadata["page"] = None
+                    chunk.metadata["page"] = 0  # Use 0 instead of None for Neo4j compatibility
+            elif chunk.metadata.get("page") is None:
+                chunk.metadata["page"] = 0  # Ensure it's never None
         
-        # Initialize OpenAI embeddings
-        logger.info("Initializing OpenAI embeddings...")
-        embeddings = OpenAIEmbeddings(
-            openai_api_key=api_key,
-            model="text-embedding-3-small"  # Cost-effective model
-        )
+        # Initialize local embeddings
+        logger.info("Initializing local embeddings...")
+        embeddings = get_embeddings()
         
         # Create or get Chroma collection and add documents
         logger.info(f"Storing embeddings in Chroma collection: {collection_name}")
@@ -157,15 +215,7 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
     Returns:
         List of embedding vectors
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable not set")
-    
-    embeddings = OpenAIEmbeddings(
-        openai_api_key=api_key,
-        model="text-embedding-3-small"
-    )
-    
+    embeddings = get_embeddings()
     return embeddings.embed_documents(texts)
 
 
@@ -179,13 +229,5 @@ def generate_query_embedding(query: str) -> List[float]:
     Returns:
         Embedding vector
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable not set")
-    
-    embeddings = OpenAIEmbeddings(
-        openai_api_key=api_key,
-        model="text-embedding-3-small"
-    )
-    
+    embeddings = get_embeddings()
     return embeddings.embed_query(query)

@@ -137,7 +137,8 @@ class GraphService:
         MERGE (c:Chunk {id: $chunk_id})
         SET c.text = $text,
             c.chunk_index = $chunk_index,
-            c.metadata = $metadata,
+            c.source = $source,
+            c.page = $page,
             c.created_at = datetime()
         WITH c
         MATCH (d:Document {id: $doc_id})
@@ -154,11 +155,17 @@ class GraphService:
         Returns:
             Chunk ID
         """
+        # Extract individual properties from metadata (Neo4j doesn't support nested Maps)
+        metadata = metadata or {}
+        source = metadata.get("source", "")
+        page = metadata.get("page", 0)
+        
         query = """
         MERGE (c:Chunk {id: $chunk_id})
         SET c.text = $text,
             c.chunk_index = $chunk_index,
-            c.metadata = $metadata,
+            c.source = $source,
+            c.page = $page,
             c.created_at = datetime()
         WITH c
         MATCH (d:Document {id: $doc_id})
@@ -174,7 +181,8 @@ class GraphService:
                     doc_id=doc_id,
                     chunk_index=chunk_index,
                     text=text[:10000],  # Limit text length
-                    metadata=metadata or {}
+                    source=source,
+                    page=page
                 )
                 record = result.single()
                 chunk_id_returned = record["id"] if record else chunk_id

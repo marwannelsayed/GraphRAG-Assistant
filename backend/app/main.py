@@ -5,7 +5,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import ingest, query
+from app.api import ingest, query, source, documents
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +27,8 @@ app.add_middleware(
 # Include routers
 app.include_router(ingest.router, prefix="/api/ingest", tags=["ingest"])
 app.include_router(query.router, prefix="/api/query", tags=["query"])
+app.include_router(source.router, prefix="/api/source", tags=["source"])
+app.include_router(documents.router, prefix="/api/documents", tags=["documents"])
 
 
 @app.get("/")
